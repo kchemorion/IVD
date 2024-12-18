@@ -1,0 +1,11 @@
+Metadata-Version: 2.1
+Name: ivd_model
+Version: 0.1
+Requires-Dist: numpy
+Requires-Dist: scipy
+Requires-Dist: pandas
+Requires-Dist: matplotlib
+Requires-Dist: seaborn
+Requires-Dist: meshio
+Requires-Dist: SALib
+Requires-Dist: scikit-learn
