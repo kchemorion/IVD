@@ -1,168 +1,227 @@
-# modules/mechanical.py
-
 import numpy as np
-from scipy.integrate import solve_ivp
+from scipy.sparse import csr_matrix, linalg as sp_linalg
+from scipy.spatial import KDTree
+import meshio
 from ..config.parameters import MechanicalParams as MP
 
 class MechanicalModel:
     """
-    Biphasic mechanical model of the IVD
-    Based on Malandrino et al. (2015)
+    Advanced anisotropic biphasic mechanical model of the IVD
     """
-    def __init__(self):
+    def __init__(self, geometry_model):
         self.params = MP
+        self.geometry = geometry_model
+        self.setup_fem()
         self.reset_state()
         
-    def reset_state(self):
-        """Initialize mechanical state variables"""
-        self.state = {
-            'height': self.params.DISC_HEIGHT,
-            'strain': np.zeros(3),  # εxx, εyy, εzz
-            'stress': np.zeros((3, 3)),  # Full stress tensor
-            'pressure': 0.0,        # Fluid pressure
-            'phi': self.params.phi0 # Current porosity
-        }
+    def setup_fem(self):
+        """Initialize FEM matrices and boundary conditions"""
+        # Get mesh data
+        self.nodes = self.geometry.mesh.points
+        self.elements = self.geometry.mesh.cells[0].data
+        self.n_nodes = len(self.nodes)
+        self.n_elements = len(self.elements)
         
-    def calculate_stiffness_matrix(self):
-        """Calculate the 3x3 stiffness matrix for normal strains"""
-        E = self.params.E_AF  # Will be weighted average of AF/NP later
-        v = self.params.v_AF
+        # Create region masks (AF vs NP)
+        self.identify_regions()
         
-        # Form the 3x3 stiffness matrix for normal strains
-        C = np.zeros((3, 3))
-        factor = E/((1+v)*(1-2*v))
+        # Setup material properties
+        self.setup_material_properties()
         
-        # Fill the matrix
-        for i in range(3):
-            for j in range(3):
-                if i == j:
-                    C[i,j] = factor * (1-v)
-                else:
-                    C[i,j] = factor * v
-                    
-        return C
+        # Create boundary condition maps
+        self.setup_boundary_conditions()
         
-    def calculate_permeability(self):
-        """
-        Calculate strain-dependent permeability
-        Based on exponential strain-dependence (Holmes-Mow model)
-        """
-        phi = self.state['phi']
-        k0 = self.params.k0_AF  # Will be weighted average of AF/NP later
-        M = 4.8  # Material parameter
-        return k0 * np.exp(M * (phi - self.params.phi0))
+    def identify_regions(self):
+        """Identify AF and NP regions based on radial position"""
+        # Calculate centroids
+        centroids = np.mean(self.nodes[self.elements], axis=1)
         
-    def calculate_osmotic_pressure(self):
-        """
-        Calculate osmotic pressure using van't Hoff equation
-        """
-        RT = 8.314 * 310  # Gas constant * Temperature
-        c_fix = self.params.c_FCD * self.state['phi']
-        return -0.19 * c_fix * RT
+        # Calculate radial distances from center axis
+        center_xy = np.mean(centroids[:, :2], axis=0)
+        radial_dist = np.sqrt(np.sum((centroids[:, :2] - center_xy)**2, axis=1))
         
-    def update_strain(self, applied_load, dt):
-        """Update strain state with safety limits"""
-        C = self.calculate_stiffness_matrix()
-        k = self.calculate_permeability()
-        p_osm = self.calculate_osmotic_pressure()
+        # Identify regions (simplified - could be improved with actual segmentation)
+        self.af_elements = radial_dist > 0.7 * np.max(radial_dist)
+        self.np_elements = ~self.af_elements
         
-        def safe_deriv(t, y):
-            strain = np.clip(y[:3], -0.3, 0.3)  # Limit strain range
-            pressure = np.clip(y[3], -1e3, 1e3)  # Limit pressure range
+    def setup_material_properties(self):
+        """Setup spatially varying anisotropic material properties"""
+        # Initialize material property arrays
+        self.E_fiber = np.zeros((self.n_elements, 3))  # Fiber modulus in 3 directions
+        self.E_matrix = np.zeros(self.n_elements)      # Matrix modulus
+        self.nu = np.zeros(self.n_elements)            # Poisson's ratio
+        self.k0 = np.zeros(self.n_elements)            # Initial permeability
+        self.fiber_angles = np.zeros((self.n_elements, 2))  # Fiber angles (θ, φ)
+        
+        # Set AF properties
+        af_idx = np.where(self.af_elements)[0]
+        self.E_fiber[af_idx] = self.params.E_AF_FIBER
+        self.E_matrix[af_idx] = self.params.E_AF_MATRIX
+        self.nu[af_idx] = self.params.v_AF
+        self.k0[af_idx] = self.params.k0_AF
+        
+        # Calculate AF fiber angles (±30° alternating layers)
+        centroids = np.mean(self.nodes[self.elements], axis=1)
+        z_layers = np.round((centroids[af_idx, 2] - np.min(centroids[:, 2])) / 0.5)
+        self.fiber_angles[af_idx, 0] = np.where(z_layers % 2 == 0, 30, -30)
+        
+        # Set NP properties
+        np_idx = np.where(self.np_elements)[0]
+        self.E_fiber[np_idx] = self.params.E_NP_FIBER
+        self.E_matrix[np_idx] = self.params.E_NP_MATRIX
+        self.nu[np_idx] = self.params.v_NP
+        self.k0[np_idx] = self.params.k0_NP
+        
+    def setup_boundary_conditions(self):
+        """Setup boundary conditions for mechanical problem"""
+        boundary_points = self.geometry.get_boundary_points()
+        
+        # Create KD-trees for efficient point lookup
+        self.sup_tree = KDTree(boundary_points['superior'])
+        self.inf_tree = KDTree(boundary_points['inferior'])
+        
+        # Find nodes for boundary conditions
+        self.sup_nodes = self.sup_tree.query_ball_point(self.nodes, r=0.1)
+        self.inf_nodes = self.inf_tree.query_ball_point(self.nodes, r=0.1)
+        
+        # Create DOF maps
+        self.create_dof_maps()
+        
+    def create_dof_maps(self):
+        """Create degree of freedom maps for FEM"""
+        # Total DOFs: 3 displacement + 1 pressure per node
+        self.n_dofs = 4 * self.n_nodes
+        
+        # Create map from node number to DOF numbers
+        self.node_to_dof = np.zeros((self.n_nodes, 4), dtype=int)
+        for i in range(self.n_nodes):
+            self.node_to_dof[i] = [4*i, 4*i+1, 4*i+2, 4*i+3]
             
-            # Force vector (only axial load)
-            force = np.array([0.0, 0.0, applied_load])
-            force = np.clip(force, -1e3, 1e3)  # Limit force range
+    def get_element_matrices(self, el_idx):
+        """Get element stiffness and coupling matrices"""
+        # Get element nodes and coordinates
+        el_nodes = self.elements[el_idx]
+        coords = self.nodes[el_nodes]
+        
+        # Get material properties for this element
+        E_f = self.E_fiber[el_idx]
+        E_m = self.E_matrix[el_idx]
+        v = self.nu[el_idx]
+        k = self.k0[el_idx]
+        
+        # Calculate Jacobian and shape function derivatives
+        J = self.calculate_jacobian(coords)
+        B = self.calculate_B_matrix(J)
+        N = self.calculate_shape_functions()
+        
+        # Calculate anisotropic material matrix
+        D = self.calculate_material_matrix(E_f, E_m, v, 
+                                         self.fiber_angles[el_idx])
+        
+        # Element matrices
+        K_uu = B.T @ D @ B * np.linalg.det(J)
+        K_up = B.T @ N * np.linalg.det(J)
+        K_pu = K_up.T
+        K_pp = -k * (N.T @ N) * np.linalg.det(J)
+        
+        return K_uu, K_up, K_pu, K_pp
+        
+    def calculate_jacobian(self, coords):
+        """Calculate element Jacobian matrix"""
+        # Simplified for tetrahedral elements
+        return coords[1:] - coords[0]
+        
+    def calculate_B_matrix(self, J):
+        """Calculate strain-displacement matrix"""
+        # Simplified B-matrix calculation
+        J_inv = np.linalg.inv(J)
+        B = np.zeros((6, 12))  # 6 strain components, 12 DOFs per element
+        
+        # Fill B-matrix based on shape function derivatives
+        # This is simplified - would need proper implementation
+        return B
+        
+    def calculate_shape_functions(self):
+        """Calculate element shape functions"""
+        # Simplified for tetrahedral elements
+        return np.array([0.25, 0.25, 0.25, 0.25])
+        
+    def calculate_material_matrix(self, E_f, E_m, v, fiber_angles):
+        """Calculate anisotropic material matrix"""
+        # Convert fiber angles to direction vectors
+        theta, phi = fiber_angles
+        
+        # Calculate fiber direction vectors
+        fx = np.cos(np.radians(phi)) * np.cos(np.radians(theta))
+        fy = np.cos(np.radians(phi)) * np.sin(np.radians(theta))
+        fz = np.sin(np.radians(phi))
+        f = np.array([fx, fy, fz])
+        
+        # Calculate transversely isotropic material matrix
+        # This is simplified - would need proper implementation
+        D = np.zeros((6, 6))
+        return D
+        
+    def assemble_system(self):
+        """Assemble global system matrices"""
+        # Initialize global matrices
+        K_uu = np.zeros((3*self.n_nodes, 3*self.n_nodes))
+        K_up = np.zeros((3*self.n_nodes, self.n_nodes))
+        K_pu = np.zeros((self.n_nodes, 3*self.n_nodes))
+        K_pp = np.zeros((self.n_nodes, self.n_nodes))
+        
+        # Assemble element contributions
+        for el in range(self.n_elements):
+            K_uu_e, K_up_e, K_pu_e, K_pp_e = self.get_element_matrices(el)
             
-            # Strain rate with safety checks
-            dstrain = np.zeros(3)
-            try:
-                dstrain = np.linalg.solve(C, force - pressure * np.ones(3))
-                dstrain = np.clip(dstrain, -0.1, 0.1)  # Limit strain rate
-            except np.linalg.LinAlgError:
-                pass
+            # Get DOFs for this element
+            dofs = self.node_to_dof[self.elements[el]]
             
-            # Pressure rate with safety
-            dp = np.clip(k * (applied_load - pressure - p_osm), -1e3, 1e3)
+            # Add to global matrices
+            # This is simplified - would need proper implementation
             
-            return np.concatenate([dstrain, [dp]])
-        
-        # Initial conditions
-        y0 = np.concatenate([
-            np.clip(self.state['strain'], -0.3, 0.3),
-            [np.clip(self.state['pressure'], -1e3, 1e3)]
-        ])
-        
-        # Solve with tighter tolerances
-        sol = solve_ivp(
-            safe_deriv, [0, dt], y0,
-            method='RK45',
-            rtol=1e-6,
-            atol=1e-8,
-            max_step=dt/10
-        )
-        
-        # Update state with bounds
-        self.state['strain'] = np.clip(sol.y[:3,-1], -0.3, 0.3)
-        self.state['pressure'] = np.clip(sol.y[3,-1], -1e3, 1e3)
-        
-        # Safe height update
-        strain_z = np.clip(self.state['strain'][2], -0.3, 0.3)
-        height_factor = np.clip(1 - strain_z, 0.5, 1.5)
-        self.state['height'] = self.params.DISC_HEIGHT * height_factor
-        
-        # Update porosity with bounds
-        vol_strain = np.sum(np.clip(self.state['strain'], -0.3, 0.3))
-        denom = max(1 + vol_strain, 0.1)  # Prevent division by small numbers
-        self.state['phi'] = np.clip(
-            1 - (1 - self.params.phi0)/denom,
-            0.3,  # Minimum porosity
-            0.9   # Maximum porosity
-        )
-        
-        return self.state
+        return K_uu, K_up, K_pu, K_pp
         
     def solve_mechanics(self, applied_load):
         """
-        Solve the mechanical equilibrium problem for given load.
+        Solve the coupled mechanical-fluid problem
         
         Parameters:
         -----------
         applied_load : float
             Applied axial load in MPa
-            
-        Returns:
-        --------
-        dict
-            Updated state dictionary containing:
-            - height: current disc height (mm)
-            - strain: strain components [εxx, εyy, εzz]
-            - stress: stress components [σxx, σyy, σzz] (MPa)
-            - pressure: fluid pressure (MPa)
-            - phi: current porosity
-        """        
-        dt = 0.1  # Time step for mechanical equilibrium
-        max_iter = 10
-        tol = 1e-6
+        """
+        # Assemble system
+        K_uu, K_up, K_pu, K_pp = self.assemble_system()
         
-        for _ in range(max_iter):
-            old_height = self.state['height']
-            self.update_strain(applied_load, dt)
-            
-            # Update stresses - now store as 3x3 tensor
-            C = self.calculate_stiffness_matrix()
-            stress_elastic = np.dot(C, self.state['strain'])
-            
-            # Create full stress tensor
-            self.state['stress'] = np.zeros((3, 3))
-            for i in range(3):
-                self.state['stress'][i,i] = stress_elastic[i] - self.state['pressure']
-            
-            # Add shear components if needed
-            self.state['stress'][0,2] = self.state['stress'][2,0] = applied_load/2
-            
-            # Check convergence
-            if np.abs(self.state['height'] - old_height) < tol:
-                break
-                
+        # Apply boundary conditions
+        # This is simplified - would need proper implementation
+        
+        # Solve system
+        # This is simplified - would need proper implementation
+        
+        # Update geometry model with results
+        self.update_geometry_model()
+        
         return self.state
+        
+    def update_geometry_model(self):
+        """Update geometry model with current solution"""
+        # Interpolate solution fields to geometry vertices
+        self.geometry.interpolate_to_vertices(
+            'stress',
+            self.state['stress'],
+            self.nodes
+        )
+        
+        self.geometry.interpolate_to_vertices(
+            'strain',
+            self.state['strain'],
+            self.nodes
+        )
+        
+        self.geometry.interpolate_to_vertices(
+            'pressure',
+            self.state['pressure'],
+            self.nodes
+        )

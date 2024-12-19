@@ -1,195 +1,293 @@
-# modules/spatial.py
-
 import numpy as np
-from scipy.sparse import csr_matrix
+from scipy.sparse import csr_matrix, lil_matrix
 from scipy.sparse.linalg import spsolve
 import meshio
+from pathlib import Path
+from ..config.parameters import MaterialParams
 
 class SpatialModel:
     """
-    Spatial distribution model using FEM
-    Based on:
-    1. Malandrino et al. (2015) - DOI: 10.1016/j.jbiomech.2015.02.002
-    2. Galbusera et al. (2011) - DOI: 10.1016/j.jbiomech.2011.04.021
+    Enhanced spatial model for IVD with distinct AF, NP, and CEP regions.
+    Handles complex geometries from STL files and implements appropriate
+    material properties and boundary conditions for each region.
     """
     
-    def __init__(self, mesh_file=None, mesh_points=None):
-        """
-        Initialize spatial model
-        
-        Parameters:
-        -----------
-        mesh_file : str, optional
-            Path to mesh file if using external mesh
-        mesh_points : int, optional
-            Number of points to use for default mesh (nx * ny)
-        """
-        if mesh_file:
-            self.mesh = meshio.read(mesh_file)
-        else:
-            if mesh_points:
-                # Calculate nx and ny to maintain aspect ratio
-                ratio = 12/10  # height/radius ratio
-                nx = int(np.sqrt(mesh_points/ratio))
-                ny = int(nx * ratio)
-            else:
-                nx, ny = 20, 30
-                
-            self.create_default_mesh(nx, ny)
-            
+    def __init__(self):
+        """Initialize the spatial model with real geometry"""
+        self.regions = {}
+        self.mesh = None
+        self.material_params = MaterialParams()
+        self.load_geometries()
         self.setup_fem()
         
-    def create_default_mesh(self, nx, ny):
-        """Create a simple axisymmetric mesh"""
-        x = np.linspace(0, 10, nx)  # radius
-        y = np.linspace(0, 12, ny)  # height
+    def load_geometries(self):
+        """Load STL files for each region and merge them"""
+        geometry_dir = Path(__file__).parent.parent / "geometry"
         
-        X, Y = np.meshgrid(x, y)
-        points = np.column_stack((X.flatten(), Y.flatten()))
-        
-        # Create triangular elements
-        cells = []
-        for j in range(ny-1):
-            for i in range(nx-1):
-                n1 = j*nx + i
-                n2 = j*nx + i + 1
-                n3 = (j+1)*nx + i
-                n4 = (j+1)*nx + i + 1
-                cells.extend([[n1, n2, n3], [n2, n4, n3]])
-                
-        self.mesh = meshio.Mesh(
-            points=points,
-            cells={'triangle': np.array(cells)}
-        )
-        
-    def setup_fem(self):
-        """Setup FEM matrices"""
-        self.nodes = self.mesh.points
-        self.elements = self.mesh.cells_dict['triangle']
-        
-        self.n_nodes = len(self.nodes)
-        self.n_elements = len(self.elements)
-        
-        # Initialize state variables at nodes
-        self.state = {
-            'displacement': np.zeros((self.n_nodes, 2)),
-            'stress': np.zeros((self.n_elements, 3)),  # σrr, σzz, σrz
-            'strain': np.zeros((self.n_elements, 3)),  # εrr, εzz, εrz
-            'pressure': np.zeros(self.n_nodes),
-            'oxygen': np.ones(self.n_nodes) * 5.8,
-            'glucose': np.ones(self.n_nodes) * 4.0
+        # Load each region
+        region_files = {
+            'AF': geometry_dir / "af.stl",
+            'NP': geometry_dir / "np.stl",
+            'CEP': geometry_dir / "cep.stl"
         }
         
-    def element_stiffness(self, nodes, E, v):
-        """Calculate element stiffness matrix"""
-        # Shape functions derivatives
-        B = np.zeros((3, 6))
+        meshes = {}
+        for region, file_path in region_files.items():
+            try:
+                meshes[region] = meshio.read(str(file_path))
+                print(f"Loaded {region} mesh: {len(meshes[region].points)} vertices, "
+                      f"{len(meshes[region].cells[0].data)} elements")
+            except Exception as e:
+                print(f"Error loading {region} mesh: {str(e)}")
+                continue
         
-        # Calculate area and shape function derivatives
-        x = nodes[:, 0]
-        y = nodes[:, 1]
+        # Merge meshes and keep track of element regions
+        self.merge_meshes(meshes)
         
-        area = 0.5 * abs(np.cross(nodes[1] - nodes[0], 
-                                 nodes[2] - nodes[0]))
+    def merge_meshes(self, meshes):
+        """Merge individual region meshes into a single mesh while tracking regions"""
+        all_points = []
+        all_cells = []
+        point_offset = 0
+        self.element_regions = []  # Track which region each element belongs to
         
-        # Form B matrix
-        for i in range(3):
-            j = (i + 1) % 3
-            k = (i + 2) % 3
-            B[0, 2*i] = (y[j] - y[k])/(2*area)
-            B[1, 2*i+1] = (x[k] - x[j])/(2*area)
-            B[2, 2*i] = B[1, 2*i+1]
-            B[2, 2*i+1] = B[0, 2*i]
+        for region, mesh in meshes.items():
+            n_points = len(mesh.points)
+            all_points.extend(mesh.points)
             
-        # Material matrix
-        D = np.zeros((3, 3))
-        factor = E/((1+v)*(1-2*v))
-        D[0,0] = D[1,1] = factor*(1-v)
-        D[0,1] = D[1,0] = factor*v
-        D[2,2] = factor*(1-2*v)/2
-        
-        return area * B.T @ D @ B
-    
-    def assemble_system(self, E, v):
-        """Assemble global stiffness matrix"""
-        ndof = 2 * self.n_nodes
-        K = np.zeros((ndof, ndof))
-        
-        for e in range(self.n_elements):
-            nodes = self.nodes[self.elements[e]]
-            Ke = self.element_stiffness(nodes, E, v)
+            # Adjust cell indices for the merged mesh
+            region_cells = mesh.cells[0].data + point_offset
+            all_cells.extend(region_cells)
             
-            # Assembly
-            for i in range(3):
-                for j in range(3):
-                    rows = 2*self.elements[e][i] + np.arange(2)
-                    cols = 2*self.elements[e][j] + np.arange(2)
-                    K[np.ix_(rows, cols)] += Ke[2*i:2*i+2, 2*j:2*j+2]
-                    
-        return csr_matrix(K)
-    
-    def solve_mechanics(self, applied_load):
-        """Solve mechanical problem"""
-        # Material properties
-        E = 2.5  # MPa
-        v = 0.4
+            # Track element regions
+            self.element_regions.extend([region] * len(mesh.cells[0].data))
+            
+            point_offset += n_points
         
-        # Assemble system
-        K = self.assemble_system(E, v)
+        # Create merged mesh
+        self.mesh = meshio.Mesh(
+            points=np.array(all_points),
+            cells=[("triangle", np.array(all_cells))]
+        )
         
-        # Apply boundary conditions
-        # Bottom fixed
-        fixed_nodes = np.where(self.nodes[:, 1] < 1e-6)[0]
-        fixed_dofs = np.concatenate([2*fixed_nodes, 2*fixed_nodes + 1])
+        # Store number of nodes and elements
+        self.n_nodes = len(self.mesh.points)
+        self.n_elements = len(all_cells)
         
-        # Top surface load
-        top_nodes = np.where(self.nodes[:, 1] > np.max(self.nodes[:, 1]) - 1e-6)[0]
-        force = np.zeros(2*self.n_nodes)
-        force[2*top_nodes + 1] = -applied_load
+        print(f"Merged mesh: {self.n_nodes} vertices, {self.n_elements} elements")
         
-        # Solve system
-        free_dofs = np.setdiff1d(np.arange(2*self.n_nodes), fixed_dofs)
-        U = np.zeros(2*self.n_nodes)
-        U[free_dofs] = spsolve(K[np.ix_(free_dofs, free_dofs)], 
-                              force[free_dofs])
+    def setup_fem(self):
+        """Setup FEM matrices and initialize state variables"""
+        self.nodes = self.mesh.points
+        self.elements = self.mesh.cells[0].data
         
-        # Update state
-        self.state['displacement'] = U.reshape(-1, 2)
+        # Initialize state variables
+        self.state = {
+            'displacement': np.zeros((self.n_nodes, 3)),  # 3D displacement field
+            'stress': np.zeros((self.n_elements, 6)),     # σxx, σyy, σzz, σxy, σyz, σxz
+            'strain': np.zeros((self.n_elements, 6)),     # εxx, εyy, εzz, γxy, γyz, γxz
+            'pressure': np.zeros(self.n_nodes),
+            'fluid_velocity': np.zeros((self.n_elements, 3))
+        }
         
-        # Calculate strains and stresses
-        self.update_stress_strain()
+        # Setup region-specific material properties
+        self.setup_material_properties()
         
-        return self.state
-    
+        # Initialize boundary condition data
+        self.identify_boundaries()
+        
+    def identify_boundaries(self):
+        """Identify boundary nodes and surfaces"""
+        # Get z coordinates
+        z_coords = self.nodes[:, 2]
+        max_z = np.max(z_coords)
+        min_z = np.min(z_coords)
+        tol = 0.1  # mm tolerance
+        
+        # Identify superior and inferior surfaces
+        self.superior_nodes = np.where(np.abs(z_coords - max_z) < tol)[0]
+        self.inferior_nodes = np.where(np.abs(z_coords - min_z) < tol)[0]
+        
+        # Identify outer AF surface nodes (for osmotic pressure boundary)
+        self.identify_outer_af_surface()
+        
+    def identify_outer_af_surface(self):
+        """Identify nodes on the outer surface of the AF"""
+        # Find elements marked as AF
+        af_elements = np.where(np.array(self.element_regions) == 'AF')[0]
+        
+        # Find boundary faces of AF elements
+        boundary_faces = set()
+        for elem in af_elements:
+            faces = [
+                tuple(sorted([self.elements[elem][i], self.elements[elem][(i+1)%3]]))
+                for i in range(3)
+            ]
+            for face in faces:
+                if face in boundary_faces:
+                    boundary_faces.remove(face)
+                else:
+                    boundary_faces.add(face)
+        
+        # Get unique nodes from boundary faces
+        self.outer_af_nodes = list(set([node for face in boundary_faces for node in face]))
+        
+    def apply_boundary_conditions(self, applied_load):
+        """Apply boundary conditions for the mechanical problem"""
+        ndof = 3 * self.n_nodes
+        force = np.zeros(ndof)
+        
+        # Fixed bottom surface (inferior endplate)
+        fixed_dofs = []
+        for node in self.inferior_nodes:
+            fixed_dofs.extend([3*node, 3*node+1, 3*node+2])
+        
+        # Applied load on superior surface
+        for node in self.superior_nodes:
+            force[3*node + 2] = -applied_load  # Negative for compression
+        
+        # Apply osmotic pressure on outer AF surface
+        self.apply_osmotic_pressure(force)
+        
+        return np.array(fixed_dofs), force
+        
+    def apply_osmotic_pressure(self, force):
+        """Apply osmotic pressure boundary conditions"""
+        for node in self.outer_af_nodes:
+            # Calculate normal vector at the node
+            normal = self.calculate_normal_vector(node)
+            
+            # Calculate osmotic pressure magnitude
+            pressure = self.calculate_osmotic_pressure(node)
+            
+            # Apply pressure force
+            force[3*node:3*node+3] += pressure * normal
+            
+    def calculate_normal_vector(self, node):
+        """Calculate normal vector at a surface node"""
+        # Find connected elements
+        connected_elements = [i for i, elem in enumerate(self.elements) 
+                            if node in elem]
+        
+        # Calculate average normal from connected faces
+        normal = np.zeros(3)
+        for elem in connected_elements:
+            # Get element vertices
+            vertices = self.nodes[self.elements[elem]]
+            
+            # Calculate element normal
+            v1 = vertices[1] - vertices[0]
+            v2 = vertices[2] - vertices[0]
+            elem_normal = np.cross(v1, v2)
+            normal += elem_normal
+            
+        # Normalize
+        return normal / np.linalg.norm(normal)
+        
+    def calculate_osmotic_pressure(self, node):
+        """Calculate osmotic pressure based on fixed charge density"""
+        # Get node position
+        pos = self.nodes[node]
+        
+        # Base osmotic pressure (can be made more sophisticated)
+        base_pressure = 0.15  # MPa
+        
+        # Vary with radial position
+        r = np.sqrt(pos[0]**2 + pos[1]**2)
+        r_max = np.max(np.sqrt(self.nodes[:,0]**2 + self.nodes[:,1]**2))
+        
+        return base_pressure * (1 - r/r_max)
+        
     def update_stress_strain(self):
-        """Calculate element strains and stresses"""
-        E = 2.5  # MPa
-        v = 0.4
+        """Update stress and strain state"""
+        U = self.state['displacement'].flatten()
         
         for e in range(self.n_elements):
+            # Get element nodes and displacements
             nodes = self.nodes[self.elements[e]]
-            U_e = self.state['displacement'][self.elements[e]].flatten()
+            elem_dof = np.array([3*n + i for n in self.elements[e] for i in range(3)])
+            u_e = U[elem_dof]
             
             # Calculate B matrix
-            B = np.zeros((3, 6))
-            area = 0.5 * abs(np.cross(nodes[1] - nodes[0],nodes[2] - nodes[0]))
-            
-            for i in range(3):
-                j = (i + 1) % 3
-                k = (i + 2) % 3
-                B[0, 2*i] = (nodes[j, 1] - nodes[k, 1])/(2*area)
-                B[1, 2*i+1] = (nodes[k, 0] - nodes[j, 0])/(2*area)
-                B[2, 2*i] = B[1, 2*i+1]
-                B[2, 2*i+1] = B[0, 2*i]
+            J = self.calculate_jacobian(nodes)
+            dN = self.calculate_shape_derivatives(J)
+            B = self.form_B_matrix(dN)
             
             # Calculate strain
-            self.state['strain'][e] = B @ U_e
+            self.state['strain'][e] = B @ u_e
             
             # Calculate stress
-            D = np.zeros((3, 3))
-            factor = E/((1+v)*(1-2*v))
-            D[0,0] = D[1,1] = factor*(1-v)
-            D[0,1] = D[1,0] = factor*v
-            D[2,2] = factor*(1-2*v)/2
-            
+            D = self.get_constitutive_matrix(e)
             self.state['stress'][e] = D @ self.state['strain'][e]
+            
+            # Update fluid velocity (Darcy's law)
+            self.update_fluid_velocity(e)
+            
+    def get_constitutive_matrix(self, element):
+        """Get constitutive matrix including fiber contribution if applicable"""
+        E = self.material_props['E'][element]
+        v = self.material_props['v'][element]
+        
+        # Get isotropic matrix
+        D = self.isotropic_material_matrix(E, v)
+        
+        # Add fiber contribution for AF
+        if self.element_regions[element] == 'AF':
+            angle = self.material_props['fiber_angle'][element]
+            density = self.material_props['fiber_density'][element]
+            D_fiber = self.fiber_material_matrix(angle, density)
+            D += D_fiber
+            
+        return D
+        
+    def update_fluid_velocity(self, element):
+        """Update fluid velocity using Darcy's law"""
+        # Get permeability
+        k = self.material_props['k'][element]
+        
+        # Calculate pressure gradient
+        nodes = self.elements[element]
+        pressures = self.state['pressure'][nodes]
+        
+        # Get shape function derivatives
+        J = self.calculate_jacobian(self.nodes[nodes])
+        dN = self.calculate_shape_derivatives(J)
+        
+        # Calculate pressure gradient
+        grad_p = dN.T @ pressures
+        
+        # Update fluid velocity (Darcy's law)
+        self.state['fluid_velocity'][element] = -k * grad_p
+        
+    def solve_coupled_problem(self, applied_load, dt):
+        """Solve coupled mechanical-fluid problem for one time step"""
+        # Solve mechanical problem
+        self.solve_mechanics(applied_load)
+        
+        # Update pressures based on volumetric strain
+        self.update_pressures(dt)
+        
+    def update_pressures(self, dt):
+        """Update pore pressures based on volumetric strain"""
+        for e in range(self.n_elements):
+            # Get volumetric strain
+            εv = np.sum(self.state['strain'][e,:3])
+            
+            # Get material properties
+            k = self.material_props['k'][e]
+            β = self.material_props['β'][e]
+            
+            # Update pressure (simplified consolidation)
+            nodes = self.elements[e]
+            self.state['pressure'][nodes] += β * εv / (k * dt)
+            
+    def get_results(self):
+        """Return current results for visualization or analysis"""
+        return {
+            'displacement': self.state['displacement'],
+            'stress': self.state['stress'],
+            'strain': self.state['strain'],
+            'pressure': self.state['pressure'],
+            'fluid_velocity': self.state['fluid_velocity'],
+            'regions': self.element_regions
+        }
